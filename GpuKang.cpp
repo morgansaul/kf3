@@ -2,6 +2,9 @@
 // (c) 2024, RetiredCoder (RC)
 // License: GPLv3, see "LICENSE.TXT" file
 // https://github.com/RetiredC
+// 
+// FIXED VERSION: Removed broken Milestone 2 multi-target code
+// Uses sequential single-target approach for correctness
 
 
 #include <iostream>
@@ -12,21 +15,13 @@
 #include <vector>
 extern std::vector<EcPoint> gTargetPoints;
 extern std::vector<EcPoint> gShiftedTargets;
+extern int gCurrentTargetIndex;  // FIX: Track current target
 
 cudaError_t cuSetGpuParams(TKparams Kparams, u64* _jmp2_table);
 void CallGpuKernelGen(TKparams Kparams);
 void CallGpuKernelABC(TKparams Kparams);
 void AddPointsToList(u32* data, int cnt, u64 ops_cnt);
 extern bool gGenMode; //tames generation mode
-
-// Custom sorting function for the Binary Search optimization
-int CompareTargets(const void* a, const void* b) {
-	u64 valA = ((u64*)a)[0];
-	u64 valB = ((u64*)b)[0];
-	if (valA < valB) return -1;
-	if (valA > valB) return 1;
-	return 0;
-}
 
 int RCGpuKang::CalcKangCnt()
 {
@@ -67,6 +62,10 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 	Kparams.KernelB_LDS_Size = 64 * JMP_CNT;
 	Kparams.KernelC_LDS_Size = 96 * JMP_CNT;
 	Kparams.IsGenMode = gGenMode;
+
+	// FIX: Sequential mode initialization - no multi-target GPU logic
+	Kparams.TargetCount = 0;
+	Kparams.d_Targets = NULL;
 
 //allocate gpu mem
 	u64 size;
@@ -263,47 +262,6 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 	}
 	free(buf);
 
-	// --- MILESTONE 2: MULTI-TARGET VRAM ALLOCATION ---
-	if (gShiftedTargets.size() > 0)
-	{
-		Kparams.TargetCount = gShiftedTargets.size();
-		u64 target_byte_size = Kparams.TargetCount * 64; // 32 bytes for X, 32 bytes for Y
-		total_mem += target_byte_size;
-
-		err = cudaMalloc((void**)&Kparams.d_Targets, target_byte_size);
-		if (err != cudaSuccess)
-		{
-			printf("GPU %d Allocate d_Targets failed: %s\n", CudaIndex, cudaGetErrorString(err));
-			return false;
-		}
-
-		u64* host_targets = (u64*)malloc(target_byte_size);
-		for (size_t i = 0; i < Kparams.TargetCount; i++)
-		{
-			// Serialize the X and Y coordinates (32 bytes each) into a flat array
-			memcpy(host_targets + i * 8, gShiftedTargets[i].x.data, 32);
-			memcpy(host_targets + i * 8 + 4, gShiftedTargets[i].y.data, 32);
-		}
-		// Sort the array so the GPU can execute a hyper-fast Binary Search
-		qsort(host_targets, Kparams.TargetCount, 64, CompareTargets);
-
-		err = cudaMemcpy(Kparams.d_Targets, host_targets, target_byte_size, cudaMemcpyHostToDevice);
-		free(host_targets);
-
-		if (err != cudaSuccess)
-		{
-			printf("GPU %d cudaMemcpy d_Targets failed: %s\n", CudaIndex, cudaGetErrorString(err));
-			return false;
-		}
-		printf("Successfully copied %llu targets to GPU %d VRAM.\r\n", Kparams.TargetCount, CudaIndex);
-	}
-	else
-	{
-		Kparams.TargetCount = 0;
-		Kparams.d_Targets = NULL;
-	}
-	// -------------------------------------------------
-
 	printf("GPU %d: allocated %llu MB, %d kangaroos. OldGpuMode: %s\r\n", CudaIndex, total_mem / (1024 * 1024), KangCnt, IsOldGpu ? "Yes" : "No");
 	return true;
 }
@@ -324,6 +282,7 @@ void RCGpuKang::Release()
 	cudaFree(Kparams.Jumps1);
 	cudaFree(Kparams.Kangs);
 	cudaFree(Kparams.DPs_out);
+	// FIX: d_Targets is always NULL in sequential mode, but check anyway
 	if (Kparams.d_Targets) cudaFree(Kparams.d_Targets);
 	if (!IsOldGpu)
 		cudaFree(Kparams.L2);
@@ -366,80 +325,44 @@ bool RCGpuKang::Start()
 	NegPntHalfRange = PntHalfRange;
 	NegPntHalfRange.y.NegModP();
 
-	PntA = ec.AddPoints(PntToSolve, NegPntHalfRange);
-	PntB = PntA;
-	PntB.y.NegModP();
+	// FIX: Only use the CURRENT target being solved, not all targets
+	// This is set by RCKangaroo.cpp before calling SolvePoint()
+	if ((gCurrentTargetIndex >= 0) && (gCurrentTargetIndex < (int)gShiftedTargets.size()))
+	{
+		PntA = ec.AddPoints(gShiftedTargets[gCurrentTargetIndex], NegPntHalfRange);
+		PntB = PntA;
+		PntB.y.NegModP();
+	}
+	else
+	{
+		// Fallback: use first target (shouldn't happen if called correctly)
+		printf("WARNING: gCurrentTargetIndex not set correctly! Using first target.\r\n");
+		PntA = ec.AddPoints(gShiftedTargets[0], NegPntHalfRange);
+		PntB = PntA;
+		PntB.y.NegModP();
+	}
 
 	RndPnts = (TPointPriv*)malloc(KangCnt * 96);
 	GenerateRndDistances();
-/* 
-	//we can calc start points on CPU
-	for (int i = 0; i < KangCnt; i++)
+
+	// FIX: Simplified wild kangaroo setup for CURRENT target only
+	// Tame kangaroos (first 1/3) start from zero
+	// Wild1 kangaroos (middle 1/3) start from PntA (target - half_range)
+	// Wild2 kangaroos (last 1/3) start from PntB (negation of PntA)
+
+	for (int i = 0; i < KangCnt / 3; i++)
 	{
-		EcInt d;
-		memcpy(d.data, RndPnts[i].priv, 24);
-		d.data[3] = 0;
-		d.data[4] = 0;
-		EcPoint p = ec.MultiplyG(d);
-		memcpy(RndPnts[i].x, p.x.data, 32);
-		memcpy(RndPnts[i].y, p.y.data, 32);
+		memset(RndPnts[i].x, 0, 64); // Tame: start from infinity
 	}
 	for (int i = KangCnt / 3; i < 2 * KangCnt / 3; i++)
 	{
-		EcPoint p;
-		p.LoadFromBuffer64((u8*)RndPnts[i].x);
-		p = ec.AddPoints(p, PntA);
-		p.SaveToBuffer64((u8*)RndPnts[i].x);
+		PntA.SaveToBuffer64((u8*)RndPnts[i].x); // Wild1: from PntA
 	}
 	for (int i = 2 * KangCnt / 3; i < KangCnt; i++)
 	{
-		EcPoint p;
-		p.LoadFromBuffer64((u8*)RndPnts[i].x);
-		p = ec.AddPoints(p, PntB);
-		p.SaveToBuffer64((u8*)RndPnts[i].x);
-	}
-	//copy to gpu
-	err = cudaMemcpy(Kparams.Kangs, RndPnts, KangCnt * 96, cudaMemcpyHostToDevice);
-	if (err != cudaSuccess)
-	{
-		printf("GPU %d, cudaMemcpy failed: %s\n", CudaIndex, cudaGetErrorString(err));
-		return false;
-	}
-/**/
-	
-// --- MULTI-TARGET WILD KANGAROO SPAWNER ---
-	// Pre-calculate the starting boundaries for EVERY target in the list
-	std::vector<u8> wild_A(gShiftedTargets.size() * 64);
-	std::vector<u8> wild_B(gShiftedTargets.size() * 64);
-	for (size_t t = 0; t < gShiftedTargets.size(); t++)
-	{
-		EcPoint t_PntA = ec.AddPoints(gShiftedTargets[t], NegPntHalfRange);
-		EcPoint t_PntB = t_PntA;
-		t_PntB.y.NegModP();
-		t_PntA.SaveToBuffer64(&wild_A[t * 64]);
-		t_PntB.SaveToBuffer64(&wild_B[t * 64]);
+		PntB.SaveToBuffer64((u8*)RndPnts[i].x); // Wild2: from PntB
 	}
 
-	for (int i = 0; i < KangCnt; i++)
-	{
-		if (i < KangCnt / 3)
-		{
-			memset(RndPnts[i].x, 0, 64); // Tame kangaroos
-		}
-		else
-		{
-			// Distribute Wild Kangaroos evenly across all shifted targets!
-			u32 wild_index = i - (KangCnt / 3);
-			u32 total_wild = KangCnt - (KangCnt / 3);
-			u32 target_idx = wild_index % gShiftedTargets.size();
-
-			if (wild_index < total_wild / 2)
-				memcpy(RndPnts[i].x, &wild_A[target_idx * 64], 64);
-			else
-				memcpy(RndPnts[i].x, &wild_B[target_idx * 64], 64);
-		}
-	}
-	// ------------------------------------------
 	//copy to gpu
 	err = cudaMemcpy(Kparams.Kangs, RndPnts, KangCnt * 96, cudaMemcpyHostToDevice);
 	if (err != cudaSuccess)
