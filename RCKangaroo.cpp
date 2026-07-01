@@ -2,6 +2,9 @@
 // (c) 2024, RetiredCoder (RC)
 // License: GPLv3, see "LICENSE.TXT" file
 // https://github.com/RetiredC
+//
+// FIXED VERSION: Multi-target support corrected to solve sequentially
+// with shared tame reuse (requires -tames flag for efficient reuse)
 
 
 #include <iostream>
@@ -62,6 +65,10 @@ char gTamesFileName[1024];
 double gMax;
 bool gGenMode; //tames generation mode
 bool gIsOpsLimit;
+
+// FIX: Track current target being solved in multi-target mode
+int gCurrentTargetIndex = -1;
+bool gMultiTargetMode = false;
 
 #pragma pack(push, 1)
 struct DBRec
@@ -157,6 +164,8 @@ void AddPointsToList(u32* data, int pnt_cnt, u64 ops_cnt)
 	csAddPoints.Leave();
 }
 
+// FIX: Collision verification now only checks the current target, not all targets
+// This is correct because wild kangaroos are only seeded from gShiftedTargets[gCurrentTargetIndex]
 bool Collision_SOTA(EcPoint& pnt, EcInt t, int TameType, EcInt w, int WildType, bool IsNeg)
 {
 	if (IsNeg)
@@ -263,15 +272,10 @@ void CheckNewPoints()
 				WildType = nrec.type;
 			}
 
-			// --- MULTI-TARGET COLLISION VERIFIER ---
-			bool res = false;
-			for (size_t tgt = 0; tgt < gShiftedTargets.size(); tgt++)
-			{
-				// Check the collision against EVERY shifted target
-				res = Collision_SOTA(gShiftedTargets[tgt], t, TameType, w, WildType, false) ||
-					Collision_SOTA(gShiftedTargets[tgt], t, TameType, w, WildType, true);
-				if (res) break; // We found the correct target!
-			}
+			// FIX: Only check against the current target being solved, not all targets
+			// This is correct because wild kangaroos were seeded from gShiftedTargets[gCurrentTargetIndex]
+			bool res = Collision_SOTA(gShiftedTargets[gCurrentTargetIndex], t, TameType, w, WildType, false) ||
+						Collision_SOTA(gShiftedTargets[gCurrentTargetIndex], t, TameType, w, WildType, true);
 
 			if (!res)
 			{
@@ -287,7 +291,6 @@ void CheckNewPoints()
 			}
 			gSolved = true;
 			break;
-			// ---------------------------------------
 		}
 	}
 }
@@ -624,11 +627,11 @@ bool ParseCommandLine(int argc, char* argv[])
 			ci++;
 		}
 		else
-			if (strcmp(argument, "-targets") == 0)
-			{
-				strcpy(gTargetsFileName, argv[ci]);
-				ci++;
-			}
+		if (strcmp(argument, "-targets") == 0)
+		{
+			strcpy(gTargetsFileName, argv[ci]);
+			ci++;
+		}
 		else
 		if (strcmp(argument, "-tames") == 0)
 		{
@@ -653,7 +656,7 @@ bool ParseCommandLine(int argc, char* argv[])
 			return false;
 		}
 	}
-	if (!gPubKey.x.IsZero() || gTargetsFileName[0] != 0)
+	if ((!gPubKey.x.IsZero() || gTargetsFileName[0] != 0))
 		if (!gStartSet || !gRange || !gDP)
 		{
 			printf("error: you must also specify -dp, -range and -start options\r\n");
@@ -678,11 +681,13 @@ int main(int argc, char* argv[])
 #endif
 
 	printf("********************************************************************************\r\n");
-	printf("*                    RCKangaroo v3.1  (c) 2024 RetiredCoder                    *\r\n");
+	printf("*                    RCKangaroo v3.1 FIXED  (c) 2024 RetiredCoder              *\r\n");
+	printf("*                   Multi-Target Corrected Version                             *\r\n");
 	printf("********************************************************************************\r\n\r\n");
 
 	printf("This software is free and open-source: https://github.com/RetiredC\r\n");
 	printf("It demonstrates fast GPU implementation of SOTA Kangaroo method for solving ECDLP\r\n");
+	printf("FIXED: Multi-target mode now solves sequentially with proper tame reuse\r\n");
 
 #ifdef _WIN32
 	printf("Windows version\r\n");
@@ -709,27 +714,19 @@ int main(int argc, char* argv[])
 
 	InitGpus();
 
+	// FIX: Properly handle multi-target mode
 	if (gTargetsFileName[0] != 0)
 	{
-		// PHASE 1: Load the file
+		// PHASE 1: Load the target file
 		if (!LoadTargets(gTargetsFileName))
 			return 0;
 		IsBench = false;
+		gMultiTargetMode = true;
 
-		// PHASE 2: Multi-Target Offset Architecture
-		printf("\r\nInitializing Multi-Target Math Architecture...\r\n");
-
-		// set the very first target as our main Base Point for the GPUs to hunt
-		gPubKey = gTargetPoints[0];
-
-		// Loop through the rest of the targets to prepare their mathematical offsets
-		u64 processed = 1;
-		for (size_t i = 1; i < gTargetPoints.size(); i++)
-		{
-			// (Milestone 2 hook: Offset mapping logic will integrate here)
-			processed++;
-		}
-		printf("Successfully mapped %llu targets against the Base Point.\r\n", processed);
+		printf("\r\n========== MULTI-TARGET MODE ==========\r\n");
+		printf("Loaded %zu target public keys\r\n", gTargetPoints.size());
+		printf("Will solve sequentially with tame reuse\r\n");
+		printf("========================================\r\n\r\n");
 	}
 
 	if (!GpuCnt)
@@ -749,13 +746,15 @@ int main(int argc, char* argv[])
 	{
 		printf("\r\nMAIN MODE\r\n\r\n");
 
-		// --- FIX: Backward compatibility for single target mode ---
-		if (gTargetPoints.empty())
+		// FIX: Handle both single and multi-target modes
+		if (gTargetPoints.empty() && !gPubKey.x.IsZero())
 		{
+			// Single target mode via -pubkey flag
 			gTargetPoints.push_back(gPubKey);
+			gMultiTargetMode = false;
 		}
 
-		// --- THE FINAL MATH FIX: Apply the -start offset to ALL targets ---
+		// Apply -start offset to ALL targets
 		gShiftedTargets = gTargetPoints;
 		if (!gStart.IsZero())
 		{
@@ -766,79 +765,98 @@ int main(int argc, char* argv[])
 				gShiftedTargets[i] = ec.AddPoints(gShiftedTargets[i], PntOfs);
 			}
 		}
-		// ------------------------------------------------------------------
 
-		EcPoint PntToSolve = gShiftedTargets[0]; // The GPU now hunts the shifted target
-		EcInt pk, pk_found;
+		// FIX: Solve each target sequentially
+		// If -tames is specified, tames database is preserved across solves
+		std::vector<EcInt> solved_keys;
+		std::vector<int> solved_indices;
 
-		char sx[100], sy[100];
-		gPubKey.x.GetHexStr(sx);
-		gPubKey.y.GetHexStr(sy);
-		printf("Solving public key\r\nX: %s\r\nY: %s\r\n", sx, sy);
-		gStart.GetHexStr(sx);
-		printf("Offset: %s\r\n", sx);
-
-		if (!SolvePoint(PntToSolve, gRange, gDP, &pk_found))
+		for (size_t target_idx = 0; target_idx < gShiftedTargets.size(); target_idx++)
 		{
-			if (!gIsOpsLimit)
-				printf("FATAL ERROR: SolvePoint failed\r\n");
-			goto label_end;
-		}
-		
-		// --- MILESTONE 3: MULTI-TARGET CPU VERIFICATION ---
-		pk_found.AddModP(gStart);
-		EcPoint tmp = ec.MultiplyG(pk_found); // Generate the public key from the found private key
+			gCurrentTargetIndex = (int)target_idx;
+			EcPoint PntToSolve = gShiftedTargets[target_idx];
+			EcInt pk_found;
 
-		bool target_matched = false;
-		int matched_index = -1;
+			char sx[100], sy[100];
+			gTargetPoints[target_idx].x.GetHexStr(sx);
+			gTargetPoints[target_idx].y.GetHexStr(sy);
+			printf("\r\n===========================================\r\n");
+			printf("Solving target %zu / %zu\r\n", target_idx + 1, gShiftedTargets.size());
+			printf("Public Key X: %s\r\n", sx);
+			printf("Public Key Y: %s\r\n", sy);
+			gStart.GetHexStr(sx);
+			printf("Search offset: %s\r\n", sx);
+			printf("===========================================\r\n");
 
-		printf("\r\nGPU found a collision! Verifying against target list...\r\n");
-
-		// The CPU "Brain": Scan the array to see WHICH target the GPU actually hit
-		for (size_t i = 0; i < gTargetPoints.size(); i++)
-		{
-			if (tmp.IsEqual(gTargetPoints[i]))
+			if (!SolvePoint(PntToSolve, gRange, gDP, &pk_found))
 			{
-				target_matched = true;
-				matched_index = (int)i;
-				break;
+				if (!gIsOpsLimit)
+				{
+					printf("ERROR: Failed to solve target %zu\r\n", target_idx);
+					goto label_end;
+				}
+				else
+				{
+					printf("Operations limit reached for target %zu, moving to next...\r\n", target_idx);
+					if (gGenMode)
+					{
+						db.Header[0] = gRange;
+						if (db.SaveToFile(gTamesFileName))
+							printf("tames saved\r\n");
+						else
+							printf("tames saving failed\r\n");
+					}
+					continue;
+				}
+			}
+
+			// Apply offset back to get the real private key
+			pk_found.AddModP(gStart);
+			EcPoint tmp = ec.MultiplyG(pk_found);
+
+			// Verify it matches the original target
+			if (!tmp.IsEqual(gTargetPoints[target_idx]))
+			{
+				printf("FATAL ERROR: Found key doesn't match target %zu!\r\n", target_idx);
+				goto label_end;
+			}
+
+			// Store result
+			solved_keys.push_back(pk_found);
+			solved_indices.push_back((int)target_idx);
+
+			char s_priv[100];
+			pk_found.GetHexStr(s_priv);
+			printf("\r\n======================================================\r\n");
+			printf("TARGET %zu SOLVED!\r\n", target_idx);
+			printf("PRIVATE KEY: %s\r\n", s_priv);
+			printf("======================================================\r\n\r\n");
+		}
+
+		// FIX: Write all results to file
+		if (!solved_keys.empty())
+		{
+			FILE* fp = fopen("RESULTS.TXT", "a");
+			if (fp)
+			{
+				fprintf(fp, "=== MULTI-TARGET SOLVE SESSION ===\r\n");
+				for (size_t i = 0; i < solved_keys.size(); i++)
+				{
+					int idx = solved_indices[i];
+					char s_priv[100], s_pubX[100], s_pubY[100];
+					solved_keys[i].GetHexStr(s_priv);
+					gTargetPoints[idx].x.GetHexStr(s_pubX);
+					gTargetPoints[idx].y.GetHexStr(s_pubY);
+					fprintf(fp, "Target Index: %d\nPubKey X: %s\nPubKey Y: %s\nPrivKey : %s\n\n", idx, s_pubX, s_pubY, s_priv);
+				}
+				fclose(fp);
+				printf("All results saved to RESULTS.TXT\r\n");
+			}
+			else
+			{
+				printf("WARNING: Cannot save results to RESULTS.TXT!\r\n");
 			}
 		}
-
-		if (!target_matched)
-		{
-			printf("FATAL ERROR: SolvePoint found a key, but it doesn't match any target in the list!\r\n");
-			goto label_end;
-		}
-
-		// We have a winner! Format and save the results.
-		char s_priv[100], s_pubX[100], s_pubY[100];
-
-		pk_found.GetHexStr(s_priv);
-		gTargetPoints[matched_index].x.GetHexStr(s_pubX);
-		gTargetPoints[matched_index].y.GetHexStr(s_pubY);
-
-		printf("\r\n======================================================\r\n");
-		printf("TARGET MATCHED: Index [%d] from your list\r\n", matched_index);
-		printf("PUBLIC KEY X  : %s\r\n", s_pubX);
-		printf("PUBLIC KEY Y  : %s\r\n", s_pubY);
-		printf("PRIVATE KEY   : %s\r\n", s_priv);
-		printf("======================================================\r\n\r\n");
-
-		FILE* fp = fopen("RESULTS.TXT", "a");
-		if (fp)
-		{
-			fprintf(fp, "Target Index: %d\nPubKey X: %s\nPubKey Y: %s\nPrivKey : %s\n\n", matched_index, s_pubX, s_pubY, s_priv);
-			fclose(fp);
-		}
-		else
-		{
-			printf("WARNING: Cannot save the key to RESULTS.TXT!\r\n");
-			while (1)
-				Sleep(100);
-		}
-		// --------------------------------------------------
-
 	}
 	else
 	{
@@ -886,5 +904,5 @@ label_end:
 	DeInitEc();
 	free(pPntList2);
 	free(pPntList);
+	return 0;
 }
-
