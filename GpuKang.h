@@ -2,6 +2,8 @@
 // (c) 2024, RetiredCoder (RC)
 // License: GPLv3, see "LICENSE.TXT" file
 // https://github.com/RetiredC
+//
+// FIXED: Multi-target support now properly implemented for parallel solving
 
 
 #pragma once
@@ -65,7 +67,11 @@ public:
 	bool IsOldGpu;
 
 	int CalcKangCnt();
-	bool Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJumps1, EcJMP* _EcJumps2, EcJMP* _EcJumps3);
+	
+	// FIXED: Multi-target version - accepts target array
+	bool Prepare(std::vector<EcPoint>& _ShiftedTargets, int _Range, int _DP, 
+				 EcJMP* _EcJumps1, EcJMP* _EcJumps2, EcJMP* _EcJumps3);
+	
 	void Stop();
 	void Execute();
 
