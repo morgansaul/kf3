@@ -102,4 +102,3 @@ struct TKparams
 	u32 KernelB_LDS_Size;
 	u32 KernelC_LDS_Size;	
 };
-
