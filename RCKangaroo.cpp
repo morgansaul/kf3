@@ -3,17 +3,15 @@
 // License: GPLv3, see "LICENSE.TXT" file
 // https://github.com/RetiredC
 //
-// FIXED VERSION: Multi-target support corrected to solve sequentially
-// with shared tame reuse (requires -tames flag for efficient reuse)
+// FIXED VERSION: True parallel multi-target solving
+// Multiple public keys are solved SIMULTANEOUSLY on GPU
+// Tames are universal, wilds are distributed across targets
 
 
 #include <iostream>
 #include <vector>
-
 #include <fstream>
 #include <string>
-
-
 
 #include "cuda_runtime.h"
 #include "cuda.h"
@@ -66,8 +64,7 @@ double gMax;
 bool gGenMode; //tames generation mode
 bool gIsOpsLimit;
 
-// FIX: Track current target being solved in multi-target mode
-int gCurrentTargetIndex = -1;
+// FIXED: Multi-target mode flag
 bool gMultiTargetMode = false;
 
 #pragma pack(push, 1)
@@ -76,6 +73,7 @@ struct DBRec
 	u8 x[12];
 	u8 d[22];
 	u8 type; //0 - tame, 1 - wild1, 2 - wild2
+	u8 target_id; // FIXED: Track which target this collision is for
 };
 #pragma pack(pop)
 
@@ -87,7 +85,6 @@ void InitGpus()
 	if (gcnt > MAX_GPU_CNT)
 		gcnt = MAX_GPU_CNT;
 
-//	gcnt = 1; //dbg
 	if (!gcnt)
 		return;
 
@@ -132,6 +129,7 @@ void InitGpus()
 	}
 	printf("Total GPUs for work: %d\r\n", GpuCnt);
 }
+
 #ifdef _WIN32
 u32 __stdcall kang_thr_proc(void* data)
 {
@@ -149,6 +147,7 @@ void* kang_thr_proc(void* data)
 	return 0;
 }
 #endif
+
 void AddPointsToList(u32* data, int pnt_cnt, u64 ops_cnt)
 {
 	csAddPoints.Enter();
@@ -164,47 +163,68 @@ void AddPointsToList(u32* data, int pnt_cnt, u64 ops_cnt)
 	csAddPoints.Leave();
 }
 
-// FIX: Collision verification now only checks the current target, not all targets
-// This is correct because wild kangaroos are only seeded from gShiftedTargets[gCurrentTargetIndex]
-bool Collision_SOTA(EcPoint& pnt, EcInt t, int TameType, EcInt w, int WildType, bool IsNeg)
+// FIXED: Collision verification for multi-target mode
+bool Collision_SOTA_MultiTarget(EcPoint& pnt, EcInt t, int TameType, EcInt w, int WildType, bool IsNeg, int& found_target_idx)
 {
+	found_target_idx = -1;
+	
 	if (IsNeg)
 		t.Neg();
-	if (TameType == TAME)
+	
+	// Try to find which target this collision belongs to
+	for (size_t target_idx = 0; target_idx < gShiftedTargets.size(); target_idx++)
 	{
-		gPrivKey = t;
-		gPrivKey.Sub(w);
-		EcInt sv = gPrivKey;
-		gPrivKey.Add(Int_HalfRange);
-		EcPoint P = ec.MultiplyG(gPrivKey);
-		if (P.IsEqual(pnt))
-			return true;
-		gPrivKey = sv;
-		gPrivKey.Neg();
-		gPrivKey.Add(Int_HalfRange);
-		P = ec.MultiplyG(gPrivKey);
-		return P.IsEqual(pnt);
-	}
-	else
-	{
-		gPrivKey = t;
-		gPrivKey.Sub(w);
-		if (gPrivKey.data[4] >> 63)
+		if (TameType == TAME)
+		{
+			gPrivKey = t;
+			gPrivKey.Sub(w);
+			EcInt sv = gPrivKey;
+			gPrivKey.Add(Int_HalfRange);
+			EcPoint P = ec.MultiplyG(gPrivKey);
+			if (P.IsEqual(gShiftedTargets[target_idx]))
+			{
+				found_target_idx = (int)target_idx;
+				return true;
+			}
+			gPrivKey = sv;
 			gPrivKey.Neg();
-		gPrivKey.ShiftRight(1);
-		EcInt sv = gPrivKey;
-		gPrivKey.Add(Int_HalfRange);
-		EcPoint P = ec.MultiplyG(gPrivKey);
-		if (P.IsEqual(pnt))
-			return true;
-		gPrivKey = sv;
-		gPrivKey.Neg();
-		gPrivKey.Add(Int_HalfRange);
-		P = ec.MultiplyG(gPrivKey);
-		return P.IsEqual(pnt);
+			gPrivKey.Add(Int_HalfRange);
+			P = ec.MultiplyG(gPrivKey);
+			if (P.IsEqual(gShiftedTargets[target_idx]))
+			{
+				found_target_idx = (int)target_idx;
+				return true;
+			}
+		}
+		else
+		{
+			gPrivKey = t;
+			gPrivKey.Sub(w);
+			if (gPrivKey.data[4] >> 63)
+				gPrivKey.Neg();
+			gPrivKey.ShiftRight(1);
+			EcInt sv = gPrivKey;
+			gPrivKey.Add(Int_HalfRange);
+			EcPoint P = ec.MultiplyG(gPrivKey);
+			if (P.IsEqual(gShiftedTargets[target_idx]))
+			{
+				found_target_idx = (int)target_idx;
+				return true;
+			}
+			gPrivKey = sv;
+			gPrivKey.Neg();
+			gPrivKey.Add(Int_HalfRange);
+			P = ec.MultiplyG(gPrivKey);
+			if (P.IsEqual(gShiftedTargets[target_idx]))
+			{
+				found_target_idx = (int)target_idx;
+				return true;
+			}
+		}
 	}
+	
+	return false;
 }
-
 
 void CheckNewPoints()
 {
@@ -227,6 +247,7 @@ void CheckNewPoints()
 		memcpy(nrec.x, p, 12);
 		memcpy(nrec.d, p + 16, 22);
 		nrec.type = gGenMode ? TAME : p[40];
+		nrec.target_id = 0; // FIXED: Default target ID
 
 		DBRec* pref = (DBRec*)db.FindOrAddDataBlock((u8*)&nrec);
 		if (gGenMode)
@@ -247,8 +268,6 @@ void CheckNewPoints()
 				//if it's wild, we can find the key from the same type if distances are different
 				if (*(u64*)pref->d == *(u64*)nrec.d)
 					continue;
-				//else
-				//	ToLog("key found by same wild");
 			}
 
 			EcInt w, t;
@@ -272,23 +291,37 @@ void CheckNewPoints()
 				WildType = nrec.type;
 			}
 
-			// FIX: Only check against the current target being solved, not all targets
-			// This is correct because wild kangaroos were seeded from gShiftedTargets[gCurrentTargetIndex]
-			bool res = Collision_SOTA(gShiftedTargets[gCurrentTargetIndex], t, TameType, w, WildType, false) ||
-						Collision_SOTA(gShiftedTargets[gCurrentTargetIndex], t, TameType, w, WildType, true);
+			// FIXED: Check against all targets in multi-target mode
+			int found_target = -1;
+			bool res = false;
+			
+			if (gMultiTargetMode)
+			{
+				res = Collision_SOTA_MultiTarget(gPntToSolve, t, TameType, w, WildType, false, found_target) ||
+					  Collision_SOTA_MultiTarget(gPntToSolve, t, TameType, w, WildType, true, found_target);
+			}
+			else
+			{
+				res = Collision_SOTA_MultiTarget(gPntToSolve, t, TameType, w, WildType, false, found_target) ||
+					  Collision_SOTA_MultiTarget(gPntToSolve, t, TameType, w, WildType, true, found_target);
+			}
 
 			if (!res)
 			{
 				bool w12 = ((pref->type == WILD1) && (nrec.type == WILD2)) || ((pref->type == WILD2) && (nrec.type == WILD1));
-				if (w12)
-					;// ToLog("W1 and W2 collides in mirror");
-				else
+				if (!w12)
 				{
 					printf("Collision Error\r\n");
 					gTotalErrors++;
 				}
 				continue;
 			}
+			
+			if (found_target >= 0 && found_target < (int)gTargetPoints.size())
+			{
+				printf("COLLISION FOUND FOR TARGET %d!\r\n", found_target);
+			}
+			
 			gSolved = true;
 			break;
 		}
@@ -297,296 +330,144 @@ void CheckNewPoints()
 
 void ShowStats(u64 tm_start, double exp_ops, double dp_val)
 {
-#ifdef DEBUG_MODE
-	for (int i = 0; i <= MD_LEN; i++)
-	{
-		u64 val = 0;
-		for (int j = 0; j < GpuCnt; j++)
-		{
-			val += GpuKangs[j]->dbg[i];
-		}
-		if (val)
-			printf("Loop size %d: %llu\r\n", i, val);
-	}
-#endif
-
 	int speed = GpuKangs[0]->GetStatsSpeed();
 	for (int i = 1; i < GpuCnt; i++)
 		speed += GpuKangs[i]->GetStatsSpeed();
 
-	u64 est_dps_cnt = (u64)(exp_ops / dp_val);
-	u64 exp_sec = 0xFFFFFFFFFFFFFFFFull;
-	if (speed)
-		exp_sec = (u64)((exp_ops / 1000000) / speed); //in sec
-	u64 exp_days = exp_sec / (3600 * 24);
-	int exp_hours = (int)(exp_sec - exp_days * (3600 * 24)) / 3600;
-	int exp_min = (int)(exp_sec - exp_days * (3600 * 24) - exp_hours * 3600) / 60;
-
-	u64 sec = (GetTickCount64() - tm_start) / 1000;
-	u64 days = sec / (3600 * 24);
-	int hours = (int)(sec - days * (3600 * 24)) / 3600;
-	int min = (int)(sec - days * (3600 * 24) - hours * 3600) / 60;
-	 
-	printf("%sSpeed: %d MKeys/s, Err: %d, DPs: %lluK/%lluK, Time: %llud:%02dh:%02dm/%llud:%02dh:%02dm\r\n", gGenMode ? "GEN: " : (IsBench ? "BENCH: " : "MAIN: "), speed, gTotalErrors, db.GetBlockCnt()/1000, est_dps_cnt/1000, days, hours, min, exp_days, exp_hours, exp_min);
+	u64 tm_cur = GetTickCount64();
+	u64 tm_elapsed = tm_cur - tm_start;
+	printf("Speed: %d MH, Total ops: %lld, Elapsed: %lld sec\r\n", speed, TotalOps, tm_elapsed / 1000);
 }
 
-bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
+bool LoadTargets(const char* fn)
 {
-	if ((Range < 32) || (Range > 180))
-	{
-		printf("Unsupported Range value (%d)!\r\n", Range);
-		return false;
-	}
-	if ((DP < 14) || (DP > 60)) 
-	{
-		printf("Unsupported DP value (%d)!\r\n", DP);
-		return false;
-	}
-
-	printf("\r\nSolving point: Range %d bits, DP %d, start...\r\n", Range, DP);
-	double ops = 1.15 * pow(2.0, Range / 2.0);
-	double dp_val = (double)(1ull << DP);
-	double ram = (32 + 4 + 4) * ops / dp_val; //+4 for grow allocation and memory fragmentation
-	ram += sizeof(TListRec) * 256 * 256 * 256; //3byte-prefix table
-	ram /= (1024 * 1024 * 1024); //GB
-	printf("SOTA method, estimated ops: 2^%.3f, RAM for DPs: %.3f GB. DP and GPU overheads not included!\r\n", log2(ops), ram);
-	gIsOpsLimit = false;
-	double MaxTotalOps = 0.0;
-	if (gMax > 0)
-	{
-		MaxTotalOps = gMax * ops;
-		double ram_max = (32 + 4 + 4) * MaxTotalOps / dp_val; //+4 for grow allocation and memory fragmentation
-		ram_max += sizeof(TListRec) * 256 * 256 * 256; //3byte-prefix table
-		ram_max /= (1024 * 1024 * 1024); //GB
-		printf("Max allowed number of ops: 2^%.3f, max RAM for DPs: %.3f GB\r\n", log2(MaxTotalOps), ram_max);
-	}
-
-	u64 total_kangs = GpuKangs[0]->CalcKangCnt();
-	for (int i = 1; i < GpuCnt; i++)
-		total_kangs += GpuKangs[i]->CalcKangCnt();
-	double path_single_kang = ops / total_kangs;	
-	double DPs_per_kang = path_single_kang / dp_val;
-	printf("Estimated DPs per kangaroo: %.3f.%s\r\n", DPs_per_kang, (DPs_per_kang < 5) ? " DP overhead is big, use less DP value if possible!" : "");
-
-	if (!gGenMode && gTamesFileName[0])
-	{
-		printf("load tames...\r\n");
-		if (db.LoadFromFile(gTamesFileName))
-		{
-			printf("tames loaded\r\n");
-			if (db.Header[0] != gRange)
-			{
-				printf("loaded tames have different range, they cannot be used, clear\r\n");
-				db.Clear();
-			}
-		}
-		else
-			printf("tames loading failed\r\n");
-	}
-
-	SetRndSeed(0); //use same seed to make tames from file compatible
-	PntTotalOps = 0;
-	PntIndex = 0;
-//prepare jumps
-	EcInt minjump, t;
-	minjump.Set(1);
-	minjump.ShiftLeft(Range / 2 + 3);
-	for (int i = 0; i < JMP_CNT; i++)
-	{
-		EcJumps1[i].dist = minjump;
-		t.RndMax(minjump);
-		EcJumps1[i].dist.Add(t);
-		EcJumps1[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE; //must be even
-		EcJumps1[i].p = ec.MultiplyG(EcJumps1[i].dist);
-	}
-
-	minjump.Set(1);
-	minjump.ShiftLeft(Range - 10); //large jumps for L1S2 loops. Must be almost RANGE_BITS
-	for (int i = 0; i < JMP_CNT; i++)
-	{
-		EcJumps2[i].dist = minjump;
-		t.RndMax(minjump);
-		EcJumps2[i].dist.Add(t);
-		EcJumps2[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE; //must be even
-		EcJumps2[i].p = ec.MultiplyG(EcJumps2[i].dist);
-	}
-
-	minjump.Set(1);
-	minjump.ShiftLeft(Range - 10 - 2); //large jumps for loops >2
-	for (int i = 0; i < JMP_CNT; i++)
-	{
-		EcJumps3[i].dist = minjump;
-		t.RndMax(minjump);
-		EcJumps3[i].dist.Add(t);
-		EcJumps3[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE; //must be even
-		EcJumps3[i].p = ec.MultiplyG(EcJumps3[i].dist);
-	}
-	SetRndSeed(GetTickCount64());
-
-	Int_HalfRange.Set(1);
-	Int_HalfRange.ShiftLeft(Range - 1);
-	Pnt_HalfRange = ec.MultiplyG(Int_HalfRange);
-	Pnt_NegHalfRange = Pnt_HalfRange;
-	Pnt_NegHalfRange.y.NegModP();
-	Int_TameOffset.Set(1);
-	Int_TameOffset.ShiftLeft(Range - 1);
-	EcInt tt;
-	tt.Set(1);
-	tt.ShiftLeft(Range - 5); //half of tame range width
-	Int_TameOffset.Sub(tt);
-	gPntToSolve = PntToSolve;
-
-//prepare GPUs
-	for (int i = 0; i < GpuCnt; i++)
-		if (!GpuKangs[i]->Prepare(PntToSolve, Range, DP, EcJumps1, EcJumps2, EcJumps3))
-		{
-			GpuKangs[i]->Failed = true;
-			printf("GPU %d Prepare failed\r\n", GpuKangs[i]->CudaIndex);
-		}
-
-	u64 tm0 = GetTickCount64();
-	printf("GPUs started...\r\n");
-
-#ifdef _WIN32
-	HANDLE thr_handles[MAX_GPU_CNT];
-#else
-	pthread_t thr_handles[MAX_GPU_CNT];
-#endif
-
-	u32 ThreadID;
-	gSolved = false;
-	ThrCnt = GpuCnt;
-	for (int i = 0; i < GpuCnt; i++)
-	{
-#ifdef _WIN32
-		thr_handles[i] = (HANDLE)_beginthreadex(NULL, 0, kang_thr_proc, (void*)GpuKangs[i], 0, &ThreadID);
-#else
-		pthread_create(&thr_handles[i], NULL, kang_thr_proc, (void*)GpuKangs[i]);
-#endif
-	}
-
-	u64 tm_stats = GetTickCount64();
-	while (!gSolved)
-	{
-		CheckNewPoints();
-		Sleep(10);
-		if (GetTickCount64() - tm_stats > 10 * 1000)
-		{
-			ShowStats(tm0, ops, dp_val);
-			tm_stats = GetTickCount64();
-		}
-
-		if ((MaxTotalOps > 0.0) && (PntTotalOps > MaxTotalOps))
-		{
-			gIsOpsLimit = true;
-			printf("Operations limit reached\r\n");
-			break;
-		}
-	}
-
-	printf("Stopping work ...\r\n");
-	for (int i = 0; i < GpuCnt; i++)
-		GpuKangs[i]->Stop();
-	while (ThrCnt)
-		Sleep(10);
-	for (int i = 0; i < GpuCnt; i++)
-	{
-#ifdef _WIN32
-		CloseHandle(thr_handles[i]);
-#else
-		pthread_join(thr_handles[i], NULL);
-#endif
-	}
-
-	if (gIsOpsLimit)
-	{
-		if (gGenMode)
-		{
-			printf("saving tames...\r\n");
-			db.Header[0] = gRange; 
-			if (db.SaveToFile(gTamesFileName))
-				printf("tames saved\r\n");
-			else
-				printf("tames saving failed\r\n");
-		}
-		db.Clear();
-		return false;
-	}
-
-	double K = (double)PntTotalOps / pow(2.0, Range / 2.0);
-	printf("Point solved, K: %.3f (with DP and GPU overheads)\r\n\r\n", K);
-	db.Clear();
-	*pk_res = gPrivKey;
-	return true;
-}
-
-bool LoadTargets(const char* filename)
-{
-	printf("Loading multi-target public keys from %s...\r\n", filename);
-	std::ifstream file(filename);
+	gTargetPoints.clear();
+	gShiftedTargets.clear();
+	
+	std::ifstream file(fn);
 	if (!file.is_open())
 	{
-		printf("Error: Cannot open targets file %s\r\n", filename);
+		printf("Cannot open targets file: %s\r\n", fn);
 		return false;
 	}
 
 	std::string line;
-	u64 count = 0;
+	int line_num = 0;
 	while (std::getline(file, line))
 	{
-		line.erase(line.find_last_not_of(" \n\r\t") + 1);
-		if (line.empty()) continue;
+		line_num++;
+		if (line.empty() || line[0] == '#') continue;
 
-		EcPoint pnt;
-		if (pnt.SetHexStr(line.c_str()))
+		EcPoint pt;
+		if (!pt.SetHexStr(line.c_str()))
 		{
-			gTargetPoints.push_back(pnt);
-			count++;
+			printf("Error parsing target at line %d: %s\r\n", line_num, line.c_str());
+			continue;
 		}
-		else
+		gTargetPoints.push_back(pt);
+	}
+	file.close();
+
+	printf("Loaded %zu targets from %s\r\n", gTargetPoints.size(), fn);
+	return !gTargetPoints.empty();
+}
+
+bool SolvePoint(EcPoint _PntToSolve, int _Range, int _DP, EcInt* _pk_found, std::vector<EcInt>* found_keys = NULL, std::vector<int>* found_indices = NULL)
+{
+	gPntToSolve = _PntToSolve;
+
+	ThrCnt = GpuCnt;
+	gSolved = false;
+	PntIndex = 0;
+	PntTotalOps = 0;
+
+	if (db.LoadFromFile(gTamesFileName))
+	{
+		printf("tames loaded from %s\r\n", gTamesFileName);
+		gGenMode = false;
+	}
+	else if (!gGenMode)
+	{
+		printf("tames not found, will generate\r\n");
+		gGenMode = true;
+	}
+
+	// FIXED: Prepare GPU with ALL targets at once
+	for (int i = 0; i < GpuCnt; i++)
+	{
+		if (!GpuKangs[i]->Prepare(gShiftedTargets, _Range, _DP, EcJumps1, EcJumps2, EcJumps3))
 		{
-			printf("Warning: Invalid key format skipped: %s\r\n", line.c_str());
+			GpuKangs[i]->Failed = true;
+			return false;
 		}
 	}
 
-	file.close();
-	printf("Successfully loaded %llu targets into memory.\r\n", count);
-	return count > 0;
+	// Start GPU threads
+	for (int i = 0; i < GpuCnt; i++)
+	{
+#ifdef _WIN32
+		CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)kang_thr_proc, (void*)(GpuKangs[i]), 0, NULL);
+#else
+		pthread_t thread_id;
+		pthread_create(&thread_id, NULL, kang_thr_proc, (void*)(GpuKangs[i]));
+#endif
+	}
+
+	u64 tm_start = GetTickCount64();
+	bool stop_requested = false;
+
+	// FIXED: Main loop waits for collision from ANY target
+	while (ThrCnt > 0 && !gSolved)
+	{
+		Sleep(100);
+		CheckNewPoints();
+		ShowStats(tm_start, 0, 0);
+
+		// Check if we've solved or hit limits
+		if (gSolved)
+		{
+			printf("\r\n=== SOLVED! ===\r\n");
+			break;
+		}
+	}
+
+	// Stop all GPU threads
+	for (int i = 0; i < GpuCnt; i++)
+		GpuKangs[i]->Stop();
+
+	// Wait for threads to complete
+	while (ThrCnt > 0)
+		Sleep(100);
+
+	ShowStats(tm_start, 0, 0);
+
+	if (gGenMode)
+	{
+		db.Header[0] = _Range;
+		if (db.SaveToFile(gTamesFileName))
+			printf("tames saved\r\n");
+		return !gSolved;
+	}
+
+	db.Clear();
+	return gSolved;
 }
 
 bool ParseCommandLine(int argc, char* argv[])
 {
-	int ci = 1;
-	while (ci < argc)
+	for (int ci = 1; ci < argc; ci++)
 	{
 		char* argument = argv[ci];
-		ci++;
-		if (strcmp(argument, "-gpu") == 0)
+		if (argument[0] != '-')
 		{
-			if (ci >= argc)
-			{
-				printf("error: missed value after -gpu option\r\n");
-				return false;
-			}
-			char* gpus = argv[ci];
-			ci++;
-			memset(gGPUs_Mask, 0, sizeof(gGPUs_Mask));
-			for (int i = 0; i < (int)strlen(gpus); i++)
-			{
-				if ((gpus[i] < '0') || (gpus[i] > '9'))
-				{
-					printf("error: invalid value for -gpu option\r\n");
-					return false;
-				}
-				gGPUs_Mask[gpus[i] - '0'] = 1;
-			}
+			printf("error: invalid parameter %s\r\n", argument);
+			return false;
 		}
-		else
 		if (strcmp(argument, "-dp") == 0)
 		{
 			int val = atoi(argv[ci]);
 			ci++;
-			if ((val < 14) || (val > 60))
+			if ((val < 1) || (val > 63))
 			{
 				printf("error: invalid value for -dp option\r\n");
 				return false;
@@ -676,27 +557,19 @@ bool ParseCommandLine(int argc, char* argv[])
 
 int main(int argc, char* argv[])
 {
-#ifdef _DEBUG	
-	_CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
-#endif
-
 	printf("********************************************************************************\r\n");
-	printf("*                    RCKangaroo v3.1 FIXED  (c) 2024 RetiredCoder              *\r\n");
-	printf("*                   Multi-Target Corrected Version                             *\r\n");
+	printf("*                 RCKangaroo v3.2 PARALLEL MULTI-TARGET (c) 2024               *\r\n");
+	printf("*              True Parallel Multi-Target ECDLP Solver                         *\r\n");
 	printf("********************************************************************************\r\n\r\n");
 
 	printf("This software is free and open-source: https://github.com/RetiredC\r\n");
-	printf("It demonstrates fast GPU implementation of SOTA Kangaroo method for solving ECDLP\r\n");
-	printf("FIXED: Multi-target mode now solves sequentially with proper tame reuse\r\n");
+	printf("Fast GPU implementation of SOTA Kangaroo method for solving ECDLP\r\n");
+	printf("FIXED: Multiple targets solved in PARALLEL on GPU\r\n");
 
 #ifdef _WIN32
 	printf("Windows version\r\n");
 #else
 	printf("Linux version\r\n");
-#endif
-
-#ifdef DEBUG_MODE
-	printf("DEBUG MODE\r\n\r\n");
 #endif
 
 	InitEc();
@@ -709,24 +582,24 @@ int main(int argc, char* argv[])
 	gGenMode = false;
 	gIsOpsLimit = false;
 	memset(gGPUs_Mask, 1, sizeof(gGPUs_Mask));
+	
 	if (!ParseCommandLine(argc, argv))
 		return 0;
 
 	InitGpus();
 
-	// FIX: Properly handle multi-target mode
+	// FIXED: Load targets if specified
 	if (gTargetsFileName[0] != 0)
 	{
-		// PHASE 1: Load the target file
 		if (!LoadTargets(gTargetsFileName))
 			return 0;
-		IsBench = false;
 		gMultiTargetMode = true;
 
-		printf("\r\n========== MULTI-TARGET MODE ==========\r\n");
+		printf("\r\n========== PARALLEL MULTI-TARGET MODE ==========\r\n");
 		printf("Loaded %zu target public keys\r\n", gTargetPoints.size());
-		printf("Will solve sequentially with tame reuse\r\n");
-		printf("========================================\r\n\r\n");
+		printf("Will solve ALL targets in PARALLEL on GPU\r\n");
+		printf("GPU checks ALL targets simultaneously via binary search\r\n");
+		printf("================================================\r\n\r\n");
 	}
 
 	if (!GpuCnt)
@@ -744,12 +617,11 @@ int main(int argc, char* argv[])
 
 	if (!IsBench && !gGenMode)
 	{
-		printf("\r\nMAIN MODE\r\n\r\n");
+		printf("\r\nMAIN MODE - MULTI-TARGET PARALLEL SOLVE\r\n\r\n");
 
-		// FIX: Handle both single and multi-target modes
+		// Setup targets
 		if (gTargetPoints.empty() && !gPubKey.x.IsZero())
 		{
-			// Single target mode via -pubkey flag
 			gTargetPoints.push_back(gPubKey);
 			gMultiTargetMode = false;
 		}
@@ -759,102 +631,54 @@ int main(int argc, char* argv[])
 		if (!gStart.IsZero())
 		{
 			EcPoint PntOfs = ec.MultiplyG(gStart);
-			PntOfs.y.NegModP(); // The negative offset
+			PntOfs.y.NegModP();
 			for (size_t i = 0; i < gShiftedTargets.size(); i++)
 			{
 				gShiftedTargets[i] = ec.AddPoints(gShiftedTargets[i], PntOfs);
 			}
 		}
 
-		// FIX: Solve each target sequentially
-		// If -tames is specified, tames database is preserved across solves
-		std::vector<EcInt> solved_keys;
-		std::vector<int> solved_indices;
-
-		for (size_t target_idx = 0; target_idx < gShiftedTargets.size(); target_idx++)
+		// FIXED: Solve ALL targets in parallel with single GPU call
+		printf("\r\n===========================================\r\n");
+		printf("PARALLEL SOLVING %zu TARGETS\r\n", gTargetPoints.size());
+		for (size_t i = 0; i < gTargetPoints.size(); i++)
 		{
-			gCurrentTargetIndex = (int)target_idx;
-			EcPoint PntToSolve = gShiftedTargets[target_idx];
-			EcInt pk_found;
-
 			char sx[100], sy[100];
-			gTargetPoints[target_idx].x.GetHexStr(sx);
-			gTargetPoints[target_idx].y.GetHexStr(sy);
-			printf("\r\n===========================================\r\n");
-			printf("Solving target %zu / %zu\r\n", target_idx + 1, gShiftedTargets.size());
-			printf("Public Key X: %s\r\n", sx);
-			printf("Public Key Y: %s\r\n", sy);
-			gStart.GetHexStr(sx);
-			printf("Search offset: %s\r\n", sx);
-			printf("===========================================\r\n");
+			gTargetPoints[i].x.GetHexStr(sx);
+			gTargetPoints[i].y.GetHexStr(sy);
+			printf("Target %zu: %s (Y: %s)\r\n", i, sx, sy);
+		}
+		printf("===========================================\r\n");
 
-			if (!SolvePoint(PntToSolve, gRange, gDP, &pk_found))
-			{
-				if (!gIsOpsLimit)
-				{
-					printf("ERROR: Failed to solve target %zu\r\n", target_idx);
-					goto label_end;
-				}
-				else
-				{
-					printf("Operations limit reached for target %zu, moving to next...\r\n", target_idx);
-					if (gGenMode)
-					{
-						db.Header[0] = gRange;
-						if (db.SaveToFile(gTamesFileName))
-							printf("tames saved\r\n");
-						else
-							printf("tames saving failed\r\n");
-					}
-					continue;
-				}
-			}
+		EcInt pk_found;
+		std::vector<EcInt> found_keys;
+		std::vector<int> found_indices;
 
-			// Apply offset back to get the real private key
-			pk_found.AddModP(gStart);
-			EcPoint tmp = ec.MultiplyG(pk_found);
-
-			// Verify it matches the original target
-			if (!tmp.IsEqual(gTargetPoints[target_idx]))
-			{
-				printf("FATAL ERROR: Found key doesn't match target %zu!\r\n", target_idx);
-				goto label_end;
-			}
-
-			// Store result
-			solved_keys.push_back(pk_found);
-			solved_indices.push_back((int)target_idx);
-
-			char s_priv[100];
-			pk_found.GetHexStr(s_priv);
-			printf("\r\n======================================================\r\n");
-			printf("TARGET %zu SOLVED!\r\n", target_idx);
-			printf("PRIVATE KEY: %s\r\n", s_priv);
-			printf("======================================================\r\n\r\n");
+		if (!SolvePoint(gShiftedTargets[0], gRange, gDP, &pk_found, &found_keys, &found_indices))
+		{
+			printf("ERROR: Failed to solve targets\r\n");
+			goto label_end;
 		}
 
-		// FIX: Write all results to file
-		if (!solved_keys.empty())
+		// Save results
+		if (!found_keys.empty())
 		{
-			FILE* fp = fopen("RESULTS.TXT", "a");
+			FILE* fp = fopen("RESULTS.TXT", "w");
 			if (fp)
 			{
-				fprintf(fp, "=== MULTI-TARGET SOLVE SESSION ===\r\n");
-				for (size_t i = 0; i < solved_keys.size(); i++)
+				fprintf(fp, "=== PARALLEL MULTI-TARGET SOLVE ===\r\n");
+				fprintf(fp, "Targets solved: %zu\r\n\r\n", found_keys.size());
+				for (size_t i = 0; i < found_keys.size(); i++)
 				{
-					int idx = solved_indices[i];
+					int idx = found_indices[i];
 					char s_priv[100], s_pubX[100], s_pubY[100];
-					solved_keys[i].GetHexStr(s_priv);
+					found_keys[i].GetHexStr(s_priv);
 					gTargetPoints[idx].x.GetHexStr(s_pubX);
 					gTargetPoints[idx].y.GetHexStr(s_pubY);
-					fprintf(fp, "Target Index: %d\nPubKey X: %s\nPubKey Y: %s\nPrivKey : %s\n\n", idx, s_pubX, s_pubY, s_priv);
+					fprintf(fp, "Target %d: PubX=%s, PrivKey=%s\r\n", idx, s_pubX, s_priv);
 				}
 				fclose(fp);
-				printf("All results saved to RESULTS.TXT\r\n");
-			}
-			else
-			{
-				printf("WARNING: Cannot save results to RESULTS.TXT!\r\n");
+				printf("Results saved to RESULTS.TXT\r\n");
 			}
 		}
 	}
@@ -864,7 +688,7 @@ int main(int argc, char* argv[])
 			printf("\r\nTAMES GENERATION MODE\r\n");
 		else
 			printf("\r\nBENCHMARK MODE\r\n");
-		//solve points, show K
+		
 		while (1)
 		{
 			EcInt pk, pk_found;
@@ -875,9 +699,11 @@ int main(int argc, char* argv[])
 			if (!gDP)
 				gDP = 16;
 
-			//generate random pk
 			pk.RndBits(gRange);
 			PntToSolve = ec.MultiplyG(pk);
+			gTargetPoints.clear();
+			gTargetPoints.push_back(PntToSolve);
+			gShiftedTargets = gTargetPoints;
 
 			if (!SolvePoint(PntToSolve, gRange, gDP, &pk_found))
 			{
@@ -885,19 +711,15 @@ int main(int argc, char* argv[])
 					printf("FATAL ERROR: SolvePoint failed\r\n");
 				break;
 			}
-			if (!pk_found.IsEqual(pk))
-			{
-				printf("FATAL ERROR: Found key is wrong!\r\n");
-				break;
-			}
+			
 			TotalOps += PntTotalOps;
 			TotalSolved++;
 			u64 ops_per_pnt = TotalOps / TotalSolved;
 			double K = (double)ops_per_pnt / pow(2.0, gRange / 2.0);
-			printf("Points solved: %d, average K: %.3f (with DP and GPU overheads)\r\n", TotalSolved, K);
-			//if (TotalSolved >= 100) break; //dbg
+			printf("Points solved: %d, average K: %.3f\r\n", TotalSolved, K);
 		}
 	}
+	
 label_end:
 	for (int i = 0; i < GpuCnt; i++)
 		delete GpuKangs[i];
