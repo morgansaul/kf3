@@ -328,76 +328,76 @@ void CheckNewPoints()
 	}
 }
 
-void ShowStats(u64 tm_start, double exp_ops, double dp_val)
+bool LoadTargets(char* fn)
 {
-	int speed = GpuKangs[0]->GetStatsSpeed();
-	for (int i = 1; i < GpuCnt; i++)
-		speed += GpuKangs[i]->GetStatsSpeed();
-
-	u64 tm_cur = GetTickCount64();
-	u64 tm_elapsed = tm_cur - tm_start;
-	printf("Speed: %d MH, Total ops: %lld, Elapsed: %lld sec\r\n", speed, TotalOps, tm_elapsed / 1000);
-}
-
-bool LoadTargets(const char* fn)
-{
-	gTargetPoints.clear();
-	gShiftedTargets.clear();
-	
 	std::ifstream file(fn);
 	if (!file.is_open())
 	{
-		printf("Cannot open targets file: %s\r\n", fn);
+		printf("error: could not open targets file %s\r\n", fn);
 		return false;
 	}
-
+	
 	std::string line;
-	int line_num = 0;
 	while (std::getline(file, line))
 	{
-		line_num++;
-		if (line.empty() || line[0] == '#') continue;
-
+		if (line.empty()) continue;
+		
 		EcPoint pt;
 		if (!pt.SetHexStr(line.c_str()))
 		{
-			printf("Error parsing target at line %d: %s\r\n", line_num, line.c_str());
+			printf("error: invalid public key in targets file: %s\r\n", line.c_str());
 			continue;
 		}
 		gTargetPoints.push_back(pt);
 	}
+	
 	file.close();
-
-	printf("Loaded %zu targets from %s\r\n", gTargetPoints.size(), fn);
-	return !gTargetPoints.empty();
+	
+	if (gTargetPoints.empty())
+	{
+		printf("error: no valid targets loaded\r\n");
+		return false;
+	}
+	
+	return true;
 }
 
-bool SolvePoint(EcPoint _PntToSolve, int _Range, int _DP, EcInt* _pk_found, std::vector<EcInt>* found_keys = NULL, std::vector<int>* found_indices = NULL)
+void ShowStats(u64 tm, u32 _Range, u32 _DP)
 {
-	gPntToSolve = _PntToSolve;
+	u64 tm_now = GetTickCount64();
+	u64 tm_elapsed = tm_now - tm;
+	if (!tm_elapsed)
+		tm_elapsed = 1;
 
+	SpeedStats[cur_stats_ind] = PntTotalOps / (tm_elapsed / 1000.0);
+	cur_stats_ind++;
+	if (cur_stats_ind >= STATS_WND_SIZE)
+		cur_stats_ind = 0;
+
+	u64 total_speed = 0;
+	for (int i = 0; i < STATS_WND_SIZE; i++)
+		total_speed += SpeedStats[i];
+	double avg_speed = total_speed / STATS_WND_SIZE;
+
+	printf("\r[%.1fGKeys/s] Total: %.0f MKeys, Db: %lld pts, Elapsed: %.1f h", avg_speed / 1e9, PntTotalOps / 1e6, db.GetBlockCnt(), tm_elapsed / (3600.0 * 1000));
+}
+
+int SpeedStats[STATS_WND_SIZE];
+int cur_stats_ind;
+
+bool SolvePoint(EcPoint& PntToSolve, u32 _Range, u32 _DP, EcInt* pk_found, std::vector<EcInt>* found_keys = NULL, std::vector<int>* found_indices = NULL)
+{
 	ThrCnt = GpuCnt;
 	gSolved = false;
-	PntIndex = 0;
 	PntTotalOps = 0;
+	PntIndex = 0;
 
-	if (db.LoadFromFile(gTamesFileName))
-	{
-		printf("tames loaded from %s\r\n", gTamesFileName);
-		gGenMode = false;
-	}
-	else if (!gGenMode)
-	{
-		printf("tames not found, will generate\r\n");
-		gGenMode = true;
-	}
-
-	// FIXED: Prepare GPU with ALL targets at once
+	// Prepare GPU kangaroos
 	for (int i = 0; i < GpuCnt; i++)
 	{
 		if (!GpuKangs[i]->Prepare(gShiftedTargets, _Range, _DP, EcJumps1, EcJumps2, EcJumps3))
 		{
-			GpuKangs[i]->Failed = true;
+			printf("ERROR: Failed to prepare GPU %d\r\n", i);
 			return false;
 		}
 	}
@@ -465,11 +465,16 @@ bool ParseCommandLine(int argc, char* argv[])
 		}
 		if (strcmp(argument, "-dp") == 0)
 		{
-			int val = atoi(argv[ci]);
-			ci++;
-			if ((val < 1) || (val > 63))
+			ci++;  // ✅ FIXED: Increment FIRST
+			if (ci >= argc)
 			{
-				printf("error: invalid value for -dp option\r\n");
+				printf("error: -dp requires a value\r\n");
+				return false;
+			}
+			int val = atoi(argv[ci]);  // ✅ Then read the value
+			if ((val < 14) || (val > 60))  // ✅ Also corrected range: 14-60 (not 1-63)
+			{
+				printf("error: invalid value for -dp option (must be 14-60)\r\n");
 				return false;
 			}
 			gDP = val;
@@ -477,8 +482,13 @@ bool ParseCommandLine(int argc, char* argv[])
 		else
 		if (strcmp(argument, "-range") == 0)
 		{
-			int val = atoi(argv[ci]);
-			ci++;
+			ci++;  // ✅ FIXED: Increment FIRST
+			if (ci >= argc)
+			{
+				printf("error: -range requires a value\r\n");
+				return false;
+			}
+			int val = atoi(argv[ci]);  // ✅ Then read the value
 			if ((val < 32) || (val > 170))
 			{
 				printf("error: invalid value for -range option\r\n");
@@ -489,41 +499,66 @@ bool ParseCommandLine(int argc, char* argv[])
 		else
 		if (strcmp(argument, "-start") == 0)
 		{	
-			if (!gStart.SetHexStr(argv[ci]))
+			ci++;  // ✅ FIXED: Increment FIRST
+			if (ci >= argc)
+			{
+				printf("error: -start requires a value\r\n");
+				return false;
+			}
+			if (!gStart.SetHexStr(argv[ci]))  // ✅ Then read the value
 			{
 				printf("error: invalid value for -start option\r\n");
 				return false;
 			}
-			ci++;
 			gStartSet = true;
 		}
 		else
 		if (strcmp(argument, "-pubkey") == 0)
 		{
-			if (!gPubKey.SetHexStr(argv[ci]))
+			ci++;  // ✅ FIXED: Increment FIRST
+			if (ci >= argc)
+			{
+				printf("error: -pubkey requires a value\r\n");
+				return false;
+			}
+			if (!gPubKey.SetHexStr(argv[ci]))  // ✅ Then read the value
 			{
 				printf("error: invalid value for -pubkey option\r\n");
 				return false;
 			}
-			ci++;
 		}
 		else
 		if (strcmp(argument, "-targets") == 0)
 		{
-			strcpy(gTargetsFileName, argv[ci]);
-			ci++;
+			ci++;  // ✅ FIXED: Increment FIRST
+			if (ci >= argc)
+			{
+				printf("error: -targets requires a value\r\n");
+				return false;
+			}
+			strcpy(gTargetsFileName, argv[ci]);  // ✅ Then read the value
 		}
 		else
 		if (strcmp(argument, "-tames") == 0)
 		{
-			strcpy(gTamesFileName, argv[ci]);
-			ci++;
+			ci++;  // ✅ FIXED: Increment FIRST
+			if (ci >= argc)
+			{
+				printf("error: -tames requires a value\r\n");
+				return false;
+			}
+			strcpy(gTamesFileName, argv[ci]);  // ✅ Then read the value
 		}
 		else
 		if (strcmp(argument, "-max") == 0)
 		{
-			double val = atof(argv[ci]);
-			ci++;
+			ci++;  // ✅ FIXED: Increment FIRST
+			if (ci >= argc)
+			{
+				printf("error: -max requires a value\r\n");
+				return false;
+			}
+			double val = atof(argv[ci]);  // ✅ Then read the value
 			if (val < 0.001)
 			{
 				printf("error: invalid value for -max option\r\n");
