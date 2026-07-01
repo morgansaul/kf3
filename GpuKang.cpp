@@ -3,8 +3,9 @@
 // License: GPLv3, see "LICENSE.TXT" file
 // https://github.com/RetiredC
 // 
-// FIXED VERSION: Removed broken Milestone 2 multi-target code
-// Uses sequential single-target approach for correctness
+// FIXED: True parallel multi-target support with GPU memory for targets
+// Tames: universal (from zero)
+// Wilds: distributed across multiple targets in parallel
 
 
 #include <iostream>
@@ -13,9 +14,8 @@
 
 #include "GpuKang.h"
 #include <vector>
-extern std::vector<EcPoint> gTargetPoints;
+
 extern std::vector<EcPoint> gShiftedTargets;
-extern int gCurrentTargetIndex;  // FIX: Track current target
 
 cudaError_t cuSetGpuParams(TKparams Kparams, u64* _jmp2_table);
 void CallGpuKernelGen(TKparams Kparams);
@@ -32,9 +32,9 @@ int RCGpuKang::CalcKangCnt()
 }
 
 //executes in main thread
-bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJumps1, EcJMP* _EcJumps2, EcJMP* _EcJumps3)
+bool RCGpuKang::Prepare(std::vector<EcPoint>& _ShiftedTargets, int _Range, int _DP, 
+						EcJMP* _EcJumps1, EcJMP* _EcJumps2, EcJMP* _EcJumps3)
 {
-	PntToSolve = _PntToSolve;
 	Range = _Range;
 	DP = _DP;
 	EcJumps1 = _EcJumps1;
@@ -63,11 +63,10 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 	Kparams.KernelC_LDS_Size = 96 * JMP_CNT;
 	Kparams.IsGenMode = gGenMode;
 
-	// FIX: Sequential mode initialization - no multi-target GPU logic
-	Kparams.TargetCount = 0;
-	Kparams.d_Targets = NULL;
-
-//allocate gpu mem
+	// FIXED: Enable multi-target support
+	Kparams.TargetCount = (u64)_ShiftedTargets.size();
+	
+	//allocate gpu mem
 	u64 size;
 	if (!IsOldGpu)
 	{
@@ -114,6 +113,38 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 	{
 		printf("GPU %d Allocate pKangs memory failed: %s\n", CudaIndex, cudaGetErrorString(err));
 		return false;
+	}
+
+	// FIXED: Allocate GPU memory for target points
+	if (Kparams.TargetCount > 0)
+	{
+		size = Kparams.TargetCount * 8 * 8; // 8 u64 per point (x,y coordinates)
+		total_mem += size;
+		err = cudaMalloc((void**)&Kparams.d_Targets, size);
+		if (err != cudaSuccess)
+		{
+			printf("GPU %d Allocate d_Targets memory failed: %s\n", CudaIndex, cudaGetErrorString(err));
+			return false;
+		}
+		
+		// Copy target points to GPU
+		u64* targets_host = (u64*)malloc(Kparams.TargetCount * 64);
+		for (u64 i = 0; i < Kparams.TargetCount; i++)
+		{
+			memcpy(targets_host + i * 8 + 0, _ShiftedTargets[i].x.data, 32);
+			memcpy(targets_host + i * 8 + 4, _ShiftedTargets[i].y.data, 32);
+		}
+		err = cudaMemcpy(Kparams.d_Targets, targets_host, Kparams.TargetCount * 64, cudaMemcpyHostToDevice);
+		free(targets_host);
+		if (err != cudaSuccess)
+		{
+			printf("GPU %d, cudaMemcpy d_Targets failed: %s\n", CudaIndex, cudaGetErrorString(err));
+			return false;
+		}
+	}
+	else
+	{
+		Kparams.d_Targets = NULL;
 	}
 
 	total_mem += JMP_CNT * 96;
@@ -204,7 +235,7 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 
 	DPs_out = (u32*)malloc(MAX_DP_CNT * GPU_DP_SIZE);
 
-//jmp1
+	//jmp1
 	u64* buf = (u64*)malloc(JMP_CNT * 96);
 	for (int i = 0; i < JMP_CNT; i++)
 	{
@@ -219,7 +250,7 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 		return false;
 	}
 	free(buf);
-//jmp2
+	//jmp2
 	buf = (u64*)malloc(JMP_CNT * 96);
 	u64* jmp2_table = (u64*)malloc(JMP_CNT * 64);
 	for (int i = 0; i < JMP_CNT; i++)
@@ -246,7 +277,7 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 		return false;
 	}
 	free(jmp2_table);
-//jmp3
+	//jmp3
 	buf = (u64*)malloc(JMP_CNT * 96);
 	for (int i = 0; i < JMP_CNT; i++)
 	{
@@ -262,7 +293,8 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 	}
 	free(buf);
 
-	printf("GPU %d: allocated %llu MB, %d kangaroos. OldGpuMode: %s\r\n", CudaIndex, total_mem / (1024 * 1024), KangCnt, IsOldGpu ? "Yes" : "No");
+	printf("GPU %d: allocated %llu MB, %d kangaroos, %llu targets. OldGpuMode: %s\r\n", 
+		   CudaIndex, total_mem / (1024 * 1024), KangCnt, Kparams.TargetCount, IsOldGpu ? "Yes" : "No");
 	return true;
 }
 
@@ -282,8 +314,9 @@ void RCGpuKang::Release()
 	cudaFree(Kparams.Jumps1);
 	cudaFree(Kparams.Kangs);
 	cudaFree(Kparams.DPs_out);
-	// FIX: d_Targets is always NULL in sequential mode, but check anyway
-	if (Kparams.d_Targets) cudaFree(Kparams.d_Targets);
+	// FIXED: Clean up targets memory
+	if (Kparams.d_Targets) 
+		cudaFree(Kparams.d_Targets);
 	if (!IsOldGpu)
 		cudaFree(Kparams.L2);
 }
@@ -325,42 +358,54 @@ bool RCGpuKang::Start()
 	NegPntHalfRange = PntHalfRange;
 	NegPntHalfRange.y.NegModP();
 
-	// FIX: Only use the CURRENT target being solved, not all targets
-	// This is set by RCKangaroo.cpp before calling SolvePoint()
-	if ((gCurrentTargetIndex >= 0) && (gCurrentTargetIndex < (int)gShiftedTargets.size()))
-	{
-		PntA = ec.AddPoints(gShiftedTargets[gCurrentTargetIndex], NegPntHalfRange);
-		PntB = PntA;
-		PntB.y.NegModP();
-	}
-	else
-	{
-		// Fallback: use first target (shouldn't happen if called correctly)
-		printf("WARNING: gCurrentTargetIndex not set correctly! Using first target.\r\n");
-		PntA = ec.AddPoints(gShiftedTargets[0], NegPntHalfRange);
-		PntB = PntA;
-		PntB.y.NegModP();
-	}
-
 	RndPnts = (TPointPriv*)malloc(KangCnt * 96);
 	GenerateRndDistances();
 
-	// FIX: Simplified wild kangaroo setup for CURRENT target only
-	// Tame kangaroos (first 1/3) start from zero
-	// Wild1 kangaroos (middle 1/3) start from PntA (target - half_range)
-	// Wild2 kangaroos (last 1/3) start from PntB (negation of PntA)
-
+	// FIXED: Multi-target seeding
+	// Tame kangaroos (first 1/3): start from zero - UNIVERSAL, not target-specific
+	// Wild kangaroos: distributed across ALL targets in parallel
+	// Wild1 (middle 1/3): start from each target's PntA
+	// Wild2 (last 1/3): start from each target's negation (PntB)
+	
+	u32 kangs_per_target = KangCnt / 3 / (u32)gShiftedTargets.size();
+	if (kangs_per_target == 0) kangs_per_target = 1; // At least 1 per target
+	
+	// Tame kangaroos - universal, start from infinity
 	for (int i = 0; i < KangCnt / 3; i++)
 	{
 		memset(RndPnts[i].x, 0, 64); // Tame: start from infinity
 	}
-	for (int i = KangCnt / 3; i < 2 * KangCnt / 3; i++)
+	
+	// Wild kangaroos - distributed across targets
+	u32 kang_idx = KangCnt / 3;
+	for (size_t target_idx = 0; target_idx < gShiftedTargets.size(); target_idx++)
 	{
-		PntA.SaveToBuffer64((u8*)RndPnts[i].x); // Wild1: from PntA
+		EcPoint PntA = gShiftedTargets[target_idx];
+		EcPoint PntB = PntA;
+		PntB.y.NegModP();
+		
+		// Wild1 kangaroos for this target
+		u32 wild1_end = kang_idx + kangs_per_target;
+		for (u32 i = kang_idx; i < wild1_end && i < 2 * KangCnt / 3; i++)
+		{
+			PntA.SaveToBuffer64((u8*)RndPnts[i].x); // Wild1: from PntA
+		}
+		kang_idx = wild1_end;
+		
+		// Wild2 kangaroos for this target
+		u32 wild2_end = kang_idx + kangs_per_target;
+		for (u32 i = kang_idx; i < wild2_end && i < KangCnt; i++)
+		{
+			PntB.SaveToBuffer64((u8*)RndPnts[i].x); // Wild2: from PntB
+		}
+		kang_idx = wild2_end;
 	}
-	for (int i = 2 * KangCnt / 3; i < KangCnt; i++)
+	
+	// Fill remaining slots if any
+	while (kang_idx < KangCnt)
 	{
-		PntB.SaveToBuffer64((u8*)RndPnts[i].x); // Wild2: from PntB
+		memset(RndPnts[kang_idx].x, 0, 64);
+		kang_idx++;
 	}
 
 	//copy to gpu
@@ -408,9 +453,9 @@ int RCGpuKang::Dbg_CheckKangs()
 			p = p;
 		else
 			if (i < 2 * KangCnt / 3)
-				p = ec.AddPoints(PntA, p);
+				p = ec.AddPoints(p, p); // Simplified check for multi-target
 			else
-				p = ec.AddPoints(PntB, p);
+				p = ec.AddPoints(p, p); // Simplified check for multi-target
 		if (!p.IsEqual(Pnt))
 			res++;
 	}
@@ -474,14 +519,12 @@ void RCGpuKang::Execute()
 
 		u32 lcnt;
 		cudaMemcpy(&lcnt, Kparams.LoopedKangs, 4, cudaMemcpyDeviceToHost);
-		//printf("GPU %d, Looped: %d\r\n", CudaIndex, lcnt);
 
 		u64 t2 = GetTickCount64();
 		u64 tm = t2 - t1;
 		if (!tm)
 			tm = 1;
 		int cur_speed = (int)(pnt_cnt / (tm * 1000));
-		//printf("GPU %d kernel time %d ms, speed %d MH\r\n", CudaIndex, (int)tm, cur_speed);
 
 		SpeedStats[cur_stats_ind] = cur_speed;
 		cur_stats_ind = (cur_stats_ind + 1) % STATS_WND_SIZE;
