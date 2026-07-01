@@ -734,8 +734,3 @@ void EcInt::RndMax(EcInt& max)
 	while (!IsLessThanU(max)) // :)
 		RndBits(bits);
 }
-
-
-
-
-
