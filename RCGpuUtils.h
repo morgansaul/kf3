@@ -627,4 +627,3 @@ __device__ __forceinline__ void InvModP(u32* res)
 	while ((int)res[8] > 0)
 		sub_288_P(res);
 }
-
